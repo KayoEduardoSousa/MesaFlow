@@ -10,6 +10,15 @@
 - adicionados Vitest e testes para autenticação, limpeza do armazenamento legado e preços em centavos
 - removidas dependências de teste ainda não usadas
 - `.env.example` passou a usar placeholders; `.env*` é ignorado pelo Git, exceto o arquivo de exemplo
+- associação do usuário com restaurante passou a ser carregada de `memberships` com escopo RLS
+- o painel usa o UUID retornado pelo RPC ao criar o restaurante
+- falha ao carregar memberships agora impede cadastro enganoso e oferece nova tentativa
+- memberships são ordenadas pelo próprio `created_at`, evitando ordenação ambígua da relação
+- dados operacionais locais são isolados por usuário autenticado; dados legados são sanitizados no escopo guest
+- respostas de criação de restaurante são descartadas se a sessão mudar antes do RPC terminar
+- migration 004 bloqueia escritas diretas em memberships e adiciona FKs compostas entre registros do mesmo restaurante
+- PGlite adicionado somente para testes locais das migrations e regras de segurança
+- testes SQL verificam isolamento de leitura, bloqueio de elevação por escrita direta, onboarding controlado e integridade produto/categoria
 
 ## [0.1.0] - 2026-11-04
 

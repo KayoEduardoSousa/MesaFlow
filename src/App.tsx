@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUpRight,
   Bell,
@@ -19,6 +19,9 @@ import { isSupabaseConfigured, supabase } from "./lib/supabase";
 import { parsePriceToCents } from "./lib/money";
 import { requireSupabaseAuth, restoreAppSession, sessionFromUser, signOutSupabaseSession, type AppSession } from "./lib/auth";
 import { withoutLegacyUsers } from "./lib/legacy-storage";
+import { mapMembershipRestaurants } from "./lib/restaurant-memberships";
+import { isScopedStorageOwnerReady, readScopedStorage, writeScopedStorage } from "./lib/scoped-storage";
+import { awaitForSession } from "./lib/session-fence";
 
 type NavItem = { label: string; icon: typeof LayoutDashboard };
 type AuthMode = "signin" | "signup";
@@ -29,7 +32,6 @@ type Restaurant = {
   name: string;
   slug: string;
   role: "owner" | "admin" | "waiter" | "kitchen";
-  createdByUserId: string;
   createdAt: string;
 };
 
@@ -93,7 +95,7 @@ type AppData = {
   orders: Order[];
 };
 
-const STORAGE_KEY = "mesaflow-demo-v1";
+const LEGACY_STORAGE_KEY = "mesaflow-demo-v1";
 const SESSION_KEY = "mesaflow-session-v1";
 
 const navigation: NavItem[] = [
@@ -135,18 +137,27 @@ function createDefaultAppData(): AppData {
   };
 }
 
-function readAppData(): AppData {
+function readAppData(userId: string | null): AppData {
   if (typeof window === "undefined") {
     return createDefaultAppData();
   }
 
   try {
-    const value = window.localStorage.getItem(STORAGE_KEY);
-    if (!value) {
-      return createDefaultAppData();
+    let source = readScopedStorage<Partial<AppData> & { users?: unknown } | null>(
+      window.localStorage,
+      userId,
+      null,
+    );
+
+    if (!source && userId === null) {
+      const legacyValue = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacyValue) {
+        source = withoutLegacyUsers(JSON.parse(legacyValue) as Partial<AppData> & { users?: unknown });
+        window.localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(source));
+      }
     }
 
-    const parsed = withoutLegacyUsers(JSON.parse(value) as Partial<AppData> & { users?: unknown });
+    const parsed = withoutLegacyUsers(source ?? {});
     return {
       ...createDefaultAppData(),
       ...parsed,
@@ -171,7 +182,19 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [userName, setUserName] = useState("Cliente");
   const [session, setSession] = useState<Session | null>(null);
-  const [appData, setAppData] = useState<AppData>(() => readAppData());
+  const sessionUserIdRef = useRef<string | null>(null);
+  const [appDataReady, setAppDataReady] = useState(true);
+  const updateSession = (nextSession: Session | null) => {
+    const nextUserId = nextSession?.userId ?? null;
+    if (sessionUserIdRef.current !== nextUserId) setAppDataReady(false);
+    sessionUserIdRef.current = nextUserId;
+    setSession(nextSession);
+  };
+  const [loadingRestaurants, setLoadingRestaurants] = useState(false);
+  const [restaurantLoadError, setRestaurantLoadError] = useState<string | null>(null);
+  const [restaurantLoadAttempt, setRestaurantLoadAttempt] = useState(0);
+  const [appData, setAppData] = useState<AppData>(() => readAppData(null));
+  const [appDataOwnerId, setAppDataOwnerId] = useState<string | null>(null);
   const [restaurant, setRestaurant] = useState<Restaurant | null>(null);
   const [restaurantForm, setRestaurantForm] = useState({ name: "", slug: "" });
   const [authForm, setAuthForm] = useState({ fullName: "", email: "", password: "" });
@@ -294,12 +317,26 @@ export default function App() {
   ];
 
   useEffect(() => {
+    const ownerId = session?.userId ?? null;
+    if (appDataOwnerId === ownerId) {
+      if (!appDataReady) setAppDataReady(true);
+      return;
+    }
+
+    setAppData(readAppData(ownerId));
+    setAppDataOwnerId(ownerId);
+    setAppDataReady(true);
+  }, [session?.userId, appDataOwnerId, appDataReady]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
-  }, [appData]);
+    const ownerId = session?.userId ?? null;
+    if (!isScopedStorageOwnerReady(appDataReady, appDataOwnerId, ownerId)) return;
+    writeScopedStorage(window.localStorage, ownerId, appData);
+  }, [appData, appDataOwnerId, appDataReady, session?.userId]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -308,7 +345,7 @@ export default function App() {
 
     const authClient = supabase;
     if (!authClient) {
-      setSession(null);
+      updateSession(null);
       return;
     }
 
@@ -319,11 +356,11 @@ export default function App() {
         if (active) setError("Não foi possível restaurar a sessão do Supabase.");
       },
     ).then((restoredSession) => {
-      if (active) setSession(restoredSession);
+      if (active) updateSession(restoredSession);
     });
 
     const { data: { subscription } } = authClient.auth.onAuthStateChange((_event, authSession) => {
-      if (active) setSession(sessionFromUser(authSession?.user ?? null));
+      if (active) updateSession(sessionFromUser(authSession?.user ?? null));
     });
 
     return () => {
@@ -333,16 +370,54 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (session) {
-      const matchingRestaurant = appData.restaurants.find((item) => item.createdByUserId === session.userId) ?? null;
-      setRestaurant(matchingRestaurant);
-      setUserName(session.fullName || "Cliente");
+    if (!session) {
+      setRestaurant(null);
+      setUserName("Cliente");
+      setLoadingRestaurants(false);
+      setRestaurantLoadError(null);
       return;
     }
 
     setRestaurant(null);
-    setUserName("Cliente");
-  }, [session, appData.restaurants]);
+    setUserName(session.fullName || "Cliente");
+    setError(null);
+    setRestaurantLoadError(null);
+    const authClient = supabase;
+    if (!authClient) {
+      setLoadingRestaurants(false);
+      return;
+    }
+
+    let active = true;
+    setLoadingRestaurants(true);
+    const loadMemberships = async () => {
+      const { data, error: membershipsError } = await authClient
+        .from("memberships")
+        .select("restaurant_id, role, created_at, restaurants!inner(id, name, slug, created_at)")
+        .eq("user_id", session.userId)
+        .eq("active", true);
+
+      if (membershipsError) throw membershipsError;
+      const memberships = mapMembershipRestaurants(data ?? []);
+      if (!active) return;
+
+      setAppData((current) => ({ ...current, restaurants: memberships }));
+      setRestaurant(memberships[0] ?? null);
+      setLoadingRestaurants(false);
+      setRestaurantLoadError(null);
+    };
+
+    void loadMemberships().catch((membershipsError: any) => {
+      if (!active) return;
+      const message = membershipsError?.message ?? "Não foi possível carregar seus restaurantes.";
+      setRestaurantLoadError(message);
+      setLoadingRestaurants(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [session?.userId, session?.fullName, restaurantLoadAttempt]);
 
   useEffect(() => {
     if (!restaurant) {
@@ -372,7 +447,7 @@ export default function App() {
           setNotice("Conta criada. Confirme o e-mail para entrar.");
           setAuthMode("signin");
         } else {
-          setSession(sessionFromUser(data.user));
+          updateSession(sessionFromUser(data.user));
           setNotice("Conta criada com sucesso.");
         }
       } else {
@@ -383,7 +458,7 @@ export default function App() {
 
         if (signInError) throw signInError;
 
-        setSession(sessionFromUser(data.user));
+        updateSession(sessionFromUser(data.user));
         setNotice("Login realizado com sucesso.");
       }
     } catch (submitError: any) {
@@ -403,6 +478,7 @@ export default function App() {
       return;
     }
 
+    const requestUserId = session.userId;
     const baseName = restaurantForm.name.trim();
     const generatedSlug = slugify(restaurantForm.slug || baseName);
 
@@ -414,45 +490,44 @@ export default function App() {
     setLoading(true);
 
     try {
-      if (isSupabaseConfigured && supabase) {
-        const { error: rpcError } = await supabase.rpc("create_restaurant_owner", {
+      const authClient = requireSupabaseAuth(supabase);
+      const { isCurrent, value: { data: restaurantId, error: rpcError } } = await awaitForSession(
+        requestUserId,
+        () => sessionUserIdRef.current,
+        () => authClient.rpc("create_restaurant_owner", {
           p_name: baseName,
           p_slug: generatedSlug,
           p_full_name: session.fullName,
-        });
+        }),
+      );
 
-        if (rpcError) throw rpcError;
-      } else {
-        const restaurantExists = appData.restaurants.some(
-          (item) => item.slug.toLowerCase() === generatedSlug.toLowerCase(),
-        );
+      if (!isCurrent) return;
 
-        if (restaurantExists) {
-          throw new Error("Já existe um restaurante com este slug.");
-        }
+      if (rpcError) throw rpcError;
+      if (!restaurantId) throw new Error("O banco não retornou o restaurante criado.");
 
-        const newRestaurant: Restaurant = {
-          id: makeId(),
-          name: baseName,
-          slug: generatedSlug,
-          role: "owner",
-          createdByUserId: session.userId,
-          createdAt: new Date().toISOString(),
-        };
+      const newRestaurant: Restaurant = {
+        id: restaurantId,
+        name: baseName,
+        slug: generatedSlug,
+        role: "owner",
+        createdAt: new Date().toISOString(),
+      };
 
-        setAppData((current) => ({
-          ...current,
-          restaurants: [newRestaurant, ...current.restaurants],
-        }));
-      }
+      setAppData((current) => ({
+        ...current,
+        restaurants: [newRestaurant, ...current.restaurants.filter((item) => item.id !== restaurantId)],
+      }));
+      setRestaurant(newRestaurant);
 
       setRestaurantForm({ name: "", slug: "" });
       setNotice("Restaurante criado com sucesso.");
       setActive("Visão geral");
     } catch (restaurantError: any) {
+      if (sessionUserIdRef.current !== requestUserId) return;
       setError(restaurantError?.message ?? "Não foi possível criar o restaurante.");
     } finally {
-      setLoading(false);
+      if (sessionUserIdRef.current === requestUserId) setLoading(false);
     }
   };
 
@@ -721,8 +796,9 @@ export default function App() {
       return;
     }
 
-    setSession(null);
+    updateSession(null);
     setRestaurant(null);
+    setLoading(false);
     setNotice("Sessão encerrada.");
   };
 
@@ -920,7 +996,33 @@ export default function App() {
             </section>
           ) : null}
 
-          {session && !restaurant && (
+          {session && loadingRestaurants && (
+            <div className="setup-notice" role="status" style={{ marginTop: 20 }}>
+              <span className="notice-icon">…</span>
+              <div><strong>Carregando restaurantes</strong><p>Verificando suas associações de acesso.</p></div>
+            </div>
+          )}
+
+          {session && restaurantLoadError && !loadingRestaurants && (
+            <section className="panel" role="alert" style={{ marginTop: 20 }}>
+              <div className="panel-heading">
+                <div>
+                  <h2>Não foi possível consultar seus restaurantes</h2>
+                  <p>{restaurantLoadError}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="secondary-button"
+                style={{ marginTop: 16 }}
+                onClick={() => setRestaurantLoadAttempt((attempt) => attempt + 1)}
+              >
+                Tentar novamente
+              </button>
+            </section>
+          )}
+
+          {session && !restaurant && !loadingRestaurants && !restaurantLoadError && (
             <section className="content-grid" style={{ marginTop: 20 }}>
               <article className="panel" style={{ padding: 24 }}>
                 <div className="panel-heading" style={{ marginBottom: 18 }}>
@@ -965,7 +1067,7 @@ export default function App() {
 
                 <ul className="feature-list">
                   <li>Usuário autenticado: {session.email}</li>
-                  <li>Perfil: administrador</li>
+                  <li>Perfil: proprietário ao concluir o cadastro</li>
                   <li>Próximo passo: criar o restaurante</li>
                 </ul>
               </article>
