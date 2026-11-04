@@ -1,4 +1,4 @@
-# MesaFlow — diagnóstico e evolução inicial
+# MesaFlow
 
 MesaFlow é um SaaS multi-tenant para gestão de restaurantes, com painel administrativo, mesas, comandas, pedidos, cozinha e cardápio público.
 
