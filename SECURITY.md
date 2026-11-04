@@ -9,8 +9,8 @@ O endpoint Supabase configurado respondeu ao health check de Auth (HTTP 200). Is
 ## Riscos atuais
 
 - O `src/App.tsx` ainda mantém cadastros, produtos, mesas, pedidos e funcionários em `localStorage`; essas telas não são persistidas no Supabase.
-- O modo local grava senhas em texto puro em `localStorage` (`mesaflow-demo-v1`). Não use esse modo com credenciais reais.
-- O estado visual da sessão também é espelhado em `localStorage`; a autorização das telas não deve ser tratada como controle de acesso.
+- O modo de autenticação local foi removido; o login exige Supabase Auth. A carga do app remove registros de credenciais e a sessão visual legados do armazenamento local.
+- A sessão atual é restaurada do Supabase Auth; autorização de cada operação continua dependendo de RLS no banco, não do estado visual do frontend.
 - A política de update em `memberships` permite a administradores atualizarem associações, e a regra `is_restaurant_admin` aceita owner/admin. Revisar cuidadosamente a possibilidade de elevar o próprio papel e impedir alteração de `user_id`/papel sem operação privilegiada.
 - Referências entre tabelas não impõem consistentemente que os registros pai e filho tenham o mesmo `restaurant_id` (por exemplo, produto/categoria, mesa/comanda e comanda/pedido).
 - As políticas de pedidos e itens permitem escritas diretas pelo cliente; mudanças de status e itens deveriam ser validadas por operações de banco com transações e regras por papel.

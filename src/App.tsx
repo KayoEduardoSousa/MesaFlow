@@ -17,10 +17,12 @@ import {
 } from "lucide-react";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
 import { parsePriceToCents } from "./lib/money";
+import { requireSupabaseAuth, restoreAppSession, sessionFromUser, signOutSupabaseSession, type AppSession } from "./lib/auth";
+import { withoutLegacyUsers } from "./lib/legacy-storage";
 
 type NavItem = { label: string; icon: typeof LayoutDashboard };
 type AuthMode = "signin" | "signup";
-type Session = { userId: string; email: string; fullName: string };
+type Session = AppSession;
 
 type Restaurant = {
   id: string;
@@ -83,7 +85,6 @@ type Order = {
 };
 
 type AppData = {
-  users: Array<{ id: string; email: string; password: string; fullName: string }>;
   restaurants: Restaurant[];
   employees: Employee[];
   categories: Category[];
@@ -125,7 +126,6 @@ function makeId() {
 
 function createDefaultAppData(): AppData {
   return {
-    users: [],
     restaurants: [],
     employees: [],
     categories: [],
@@ -146,11 +146,10 @@ function readAppData(): AppData {
       return createDefaultAppData();
     }
 
-    const parsed = JSON.parse(value) as Partial<AppData>;
+    const parsed = withoutLegacyUsers(JSON.parse(value) as Partial<AppData> & { users?: unknown });
     return {
       ...createDefaultAppData(),
       ...parsed,
-      users: parsed.users ?? [],
       restaurants: parsed.restaurants ?? [],
       employees: parsed.employees ?? [],
       categories: parsed.categories ?? [],
@@ -163,19 +162,6 @@ function readAppData(): AppData {
   }
 }
 
-function readSession(): Session | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  try {
-    const value = window.localStorage.getItem(SESSION_KEY);
-    return value ? (JSON.parse(value) as Session) : null;
-  } catch {
-    return null;
-  }
-}
-
 export default function App() {
   const [active, setActive] = useState("Visão geral");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -184,7 +170,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [userName, setUserName] = useState("Cliente");
-  const [session, setSession] = useState<Session | null>(() => readSession());
+  const [session, setSession] = useState<Session | null>(null);
   const [appData, setAppData] = useState<AppData>(() => readAppData());
   const [restaurant, setRestaurant] = useState<Restaurant | null>(null);
   const [restaurantForm, setRestaurantForm] = useState({ name: "", slug: "" });
@@ -316,16 +302,35 @@ export default function App() {
   }, [appData]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(SESSION_KEY);
+    }
+
+    const authClient = supabase;
+    if (!authClient) {
+      setSession(null);
       return;
     }
 
-    if (session) {
-      window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-    } else {
-      window.localStorage.removeItem(SESSION_KEY);
-    }
-  }, [session]);
+    let active = true;
+    void restoreAppSession(
+      () => authClient.auth.getSession(),
+      () => {
+        if (active) setError("Não foi possível restaurar a sessão do Supabase.");
+      },
+    ).then((restoredSession) => {
+      if (active) setSession(restoredSession);
+    });
+
+    const { data: { subscription } } = authClient.auth.onAuthStateChange((_event, authSession) => {
+      if (active) setSession(sessionFromUser(authSession?.user ?? null));
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (session) {
@@ -346,13 +351,6 @@ export default function App() {
     }
   }, [restaurant]);
 
-  const persistLocalUser = (user: { id: string; email: string; password: string; fullName: string }) => {
-    setAppData((current) => ({
-      ...current,
-      users: [...current.users.filter((item) => item.email !== user.email), user],
-    }));
-  };
-
   const handleAuthSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
@@ -360,82 +358,32 @@ export default function App() {
     setLoading(true);
 
     try {
-      if (isSupabaseConfigured && supabase) {
-        if (authMode === "signup") {
-          const { data, error: signUpError } = await supabase.auth.signUp({
-            email: authForm.email,
-            password: authForm.password,
-            options: { data: { full_name: authForm.fullName } },
-          });
-
-          if (signUpError) throw signUpError;
-
-          if (data.user && !data.session) {
-            setNotice("Conta criada. Confirme o e-mail para entrar.");
-            setAuthMode("signin");
-          } else {
-            setSession({
-              userId: data.user?.id ?? "",
-              email: data.user?.email ?? authForm.email,
-              fullName: data.user?.user_metadata?.full_name || authForm.fullName || "Administrador",
-            });
-            setUserName(authForm.fullName || data.user?.email || "Administrador");
-            setNotice("Conta criada com sucesso.");
-          }
-        } else {
-          const { data, error: signInError } = await supabase.auth.signInWithPassword({
-            email: authForm.email,
-            password: authForm.password,
-          });
-
-          if (signInError) throw signInError;
-
-          setSession({
-            userId: data.user?.id ?? "",
-            email: data.user?.email ?? authForm.email,
-            fullName: data.user?.user_metadata?.full_name || authForm.fullName || "Administrador",
-          });
-          setUserName(data.user?.user_metadata?.full_name || data.user?.email || "Administrador");
-          setNotice("Login realizado com sucesso.");
-        }
-
-        setLoading(false);
-        return;
-      }
-
-      const normalizedEmail = authForm.email.trim().toLowerCase();
-      if (!normalizedEmail || !authForm.password.trim()) {
-        throw new Error("Informe e-mail e senha para continuar.");
-      }
-
+      const auth = requireSupabaseAuth(supabase);
       if (authMode === "signup") {
-        const alreadyExists = appData.users.some((user) => user.email.toLowerCase() === normalizedEmail);
-        if (alreadyExists) {
-          throw new Error("Este e-mail já está cadastrado no ambiente local.");
-        }
-
-        const nextUser = {
-          id: makeId(),
-          email: normalizedEmail,
+        const { data, error: signUpError } = await auth.auth.signUp({
+          email: authForm.email,
           password: authForm.password,
-          fullName: authForm.fullName.trim() || "Administrador",
-        };
+          options: { data: { full_name: authForm.fullName } },
+        });
 
-        persistLocalUser(nextUser);
-        setSession({ userId: nextUser.id, email: nextUser.email, fullName: nextUser.fullName });
-        setUserName(nextUser.fullName);
-        setNotice("Conta criada com sucesso no ambiente local.");
-      } else {
-        const user = appData.users.find(
-          (item) => item.email.toLowerCase() === normalizedEmail && item.password === authForm.password,
-        );
+        if (signUpError) throw signUpError;
 
-        if (!user) {
-          throw new Error("E-mail ou senha inválidos.");
+        if (data.user && !data.session) {
+          setNotice("Conta criada. Confirme o e-mail para entrar.");
+          setAuthMode("signin");
+        } else {
+          setSession(sessionFromUser(data.user));
+          setNotice("Conta criada com sucesso.");
         }
+      } else {
+        const { data, error: signInError } = await auth.auth.signInWithPassword({
+          email: authForm.email,
+          password: authForm.password,
+        });
 
-        setSession({ userId: user.id, email: user.email, fullName: user.fullName });
-        setUserName(user.fullName);
+        if (signInError) throw signInError;
+
+        setSession(sessionFromUser(data.user));
         setNotice("Login realizado com sucesso.");
       }
     } catch (submitError: any) {
@@ -763,8 +711,14 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    if (isSupabaseConfigured && supabase) {
-      await supabase.auth.signOut();
+    try {
+      const authClient = supabase;
+      if (isSupabaseConfigured && authClient) {
+        await signOutSupabaseSession(() => authClient.auth.signOut());
+      }
+    } catch (signOutError: any) {
+      setError(signOutError?.message ?? "Não foi possível encerrar a sessão.");
+      return;
     }
 
     setSession(null);

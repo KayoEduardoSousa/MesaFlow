@@ -18,5 +18,5 @@
 - [x] validar conversão de preços para centavos inteiros com testes
 - [ ] revisar e corrigir segurança das migrations/RLS (requer validação SQL)
 - [ ] migrar persistência das telas do navegador para o Supabase
-- [ ] remover modo local inseguro e estado de sessão paralelo
+- [x] remover autenticação local e espelhamento de sessão inseguro
 - [ ] criar integração de dados por domínio com validação multi-tenant

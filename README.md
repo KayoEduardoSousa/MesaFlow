@@ -123,10 +123,10 @@ As variáveis `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` estão configuradas
 
 ## Limitações e riscos confirmados
 
-- O login e cadastro usam Supabase Auth quando as variáveis estão presentes; sem configuração, existe um modo local inseguro que grava senha em texto puro no `localStorage`. Não use credenciais reais nesse modo.
+- Login e cadastro exigem Supabase Auth. O modo de autenticação local foi removido; credenciais legadas são eliminadas do armazenamento local ao iniciar o app.
 - As operações de restaurante, categorias, produtos, funcionários, mesas, pedidos e status atualmente alteram estado local, não dados do Supabase.
 - O build de produção (`npm run build`) concluiu com sucesso nesta auditoria.
-- O projeto não tem configuração de testes automatizados (`test` script/dependências) e não há diretório `.git` no caminho informado.
+- O projeto usa Vitest para testes unitários; testes de integração e de segurança multi-tenant ainda faltam.
 - A migration 002 contém políticas RLS iniciais, mas exige revisão de escalada de privilégios e integridade entre tabelas antes de considerar o backend seguro.
 - Não foi verificado o histórico remoto de migrations; a conectividade Auth não prova que o banco esteja provisionado.
 
